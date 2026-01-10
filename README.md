@@ -9,11 +9,21 @@ This is a patched fork of [elsbrock/plundrio](https://github.com/elsbrock/plundr
    - Enables Sonarr/Radarr to track downloads
 
 2. **Case-insensitive hash matching** (`internal/server/torrent.go`)
-   - Uses `strings.EqualFold()` for hash comparison
+   - Uses `strings.EqualFold()` for hash comparison in both `findTransferByHash` and `handleTorrentGet`
    - Fixes mismatch between uppercase hashes from *arr and lowercase from Put.io
 
 3. **AddTransfer returns transfer info** (`internal/api/client.go`)
    - Returns `(*putio.Transfer, error)` instead of just `error`
+
+4. **Fixed torrent-remove to delete local data** (`internal/server/torrent.go`)
+   - Now properly handles `delete-local-data` flag from *arr apps
+   - Deletes local download folder when removal is requested
+   - Enables automatic cleanup of downloads after import
+
+5. **Folder-scoped hash matching for deletions** (`internal/server/torrent.go`)
+   - `findTransferByHash` now only matches transfers in plundrio's configured folder
+   - Prevents accidental deletion of content in other put.io folders (e.g., chill.institute)
+   - Previously, if a transfer in another folder had the same hash, it could be deleted
 
 ## Build & Deploy
 

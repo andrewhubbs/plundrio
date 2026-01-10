@@ -4,24 +4,30 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/elsbrock/go-putio"
 	"github.com/elsbrock/plundrio/internal/log"
 )
 
-// findTransferByHash finds a transfer by its hash string
+// findTransferByHash finds a transfer by its hash string (case-insensitive)
+// Only matches transfers in plundrio's configured folder to prevent accidental
+// deletion of content in other folders (e.g., chill.institute)
 func (s *Server) findTransferByHash(hash string) (*putio.Transfer, error) {
 	transfers, err := s.client.GetTransfers()
 	if err != nil {
 		return nil, err
 	}
 	for _, t := range transfers {
-		if t.Hash == hash {
+		// Case-insensitive hash comparison (Radarr sends uppercase, Put.io stores lowercase)
+		// AND verify the transfer belongs to plundrio's folder
+		if strings.EqualFold(t.Hash, hash) && t.SaveParentID == s.cfg.FolderID {
 			return t, nil
 		}
 	}
-	return nil, fmt.Errorf("transfer not found with hash: %s", hash)
+	return nil, fmt.Errorf("transfer not found with hash: %s (in folder %d)", hash, s.cfg.FolderID)
 }
 
 // handleTorrentAdd processes torrent-add requests
@@ -337,42 +343,92 @@ func (s *Server) handleTorrentRemove(args json.RawMessage) (interface{}, error) 
 		return nil, fmt.Errorf("invalid arguments: %w", err)
 	}
 
+	var lastErr error
+	successCount := 0
+
 	for _, hash := range params.IDs {
 		transfer, err := s.findTransferByHash(hash)
 		if err != nil {
-			log.Error("rpc").
+			log.Warn("rpc").
 				Str("operation", "torrent-remove").
 				Str("hash", hash).
 				Err(err).
-				Msg("Failed to find transfer")
+				Msg("Transfer not found in Put.io - may already be removed")
+			// Don't treat "not found" as an error - the transfer might already be gone
+			// Continue to try deleting local data if requested
+		}
+
+		// Delete local data if requested and transfer name is known
+		if params.DeleteLocalData && s.cfg.TargetDir != "" && transfer != nil {
+			localPath := filepath.Join(s.cfg.TargetDir, transfer.Name)
+			if _, statErr := os.Stat(localPath); statErr == nil {
+				if removeErr := os.RemoveAll(localPath); removeErr != nil {
+					log.Error("rpc").
+						Str("operation", "torrent-remove").
+						Str("hash", hash).
+						Str("path", localPath).
+						Err(removeErr).
+						Msg("Failed to delete local data")
+					lastErr = removeErr
+				} else {
+					log.Info("rpc").
+						Str("operation", "torrent-remove").
+						Str("hash", hash).
+						Str("path", localPath).
+						Msg("Deleted local data")
+				}
+			}
+		}
+
+		// Skip Put.io deletion if transfer wasn't found
+		if transfer == nil {
 			continue
 		}
 
-		// Delete the files of the transfer
-		if err := s.client.DeleteFile(transfer.FileID); err != nil {
-			log.Error("rpc").
-				Str("operation", "torrent-remove").
-				Str("hash", hash).
-				Int64("transfer_id", transfer.ID).
-				Err(err).
-				Msg("Failed to delete transfer files")
+		// Delete the files from Put.io
+		if transfer.FileID != 0 {
+			if err := s.client.DeleteFile(transfer.FileID); err != nil {
+				log.Error("rpc").
+					Str("operation", "torrent-remove").
+					Str("hash", hash).
+					Int64("transfer_id", transfer.ID).
+					Int64("file_id", transfer.FileID).
+					Err(err).
+					Msg("Failed to delete transfer files from Put.io")
+				lastErr = err
+			}
 		}
 
+		// Delete the transfer from Put.io
 		if err := s.client.DeleteTransfer(transfer.ID); err != nil {
 			log.Error("rpc").
 				Str("operation", "torrent-remove").
 				Str("hash", hash).
 				Int64("transfer_id", transfer.ID).
 				Err(err).
-				Msg("Failed to delete transfer")
+				Msg("Failed to delete transfer from Put.io")
+			lastErr = err
 		} else {
+			successCount++
 			log.Info("rpc").
 				Str("operation", "torrent-remove").
 				Str("hash", hash).
+				Str("name", transfer.Name).
 				Int64("transfer_id", transfer.ID).
 				Bool("delete_local_data", params.DeleteLocalData).
-				Msg("Transfer removed")
+				Msg("Transfer removed from Put.io")
 		}
+	}
+
+	// Return success even if some deletions failed - this matches Transmission behavior
+	// The important thing is that we attempted the deletions
+	if lastErr != nil && successCount == 0 {
+		log.Warn("rpc").
+			Str("operation", "torrent-remove").
+			Int("requested", len(params.IDs)).
+			Int("succeeded", successCount).
+			Err(lastErr).
+			Msg("Some removals failed")
 	}
 
 	return struct{}{}, nil
