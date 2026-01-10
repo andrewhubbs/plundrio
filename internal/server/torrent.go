@@ -72,20 +72,27 @@ func (s *Server) handleTorrentAdd(args json.RawMessage) (interface{}, error) {
 		}
 
 		// Add magnet link to Put.io
-		if err := s.client.AddTransfer(name, s.cfg.FolderID); err != nil {
+		transfer, err := s.client.AddTransfer(name, s.cfg.FolderID)
+		if err != nil {
 			return nil, fmt.Errorf("failed to add transfer: %w", err)
 		}
 
 		log.Info("rpc").
 			Str("operation", "torrent-add").
 			Str("type", "magnet").
-			Str("magnet", name).
+			Str("name", transfer.Name).
+			Str("hash", transfer.Hash).
+			Int64("id", transfer.ID).
 			Int64("folder_id", s.cfg.FolderID).
 			Msg("Magnet link added")
 
-		// Return success response
+		// Return success response with transfer info for *arr tracking
 		return map[string]interface{}{
-			"torrent-added": map[string]interface{}{},
+			"torrent-added": map[string]interface{}{
+				"id":         transfer.ID,
+				"name":       transfer.Name,
+				"hashString": transfer.Hash,
+			},
 		}, nil
 	}
 
@@ -146,7 +153,8 @@ func (s *Server) handleTorrentGet(args json.RawMessage) (interface{}, error) {
 		if len(params.IDs) > 0 {
 			found := false
 			for _, id := range params.IDs {
-				if id == t.Hash {
+				// Case-insensitive hash comparison (hashes are hex strings)
+				if strings.EqualFold(id, t.Hash) {
 					found = true
 					break
 				}

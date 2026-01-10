@@ -1,3 +1,33 @@
+# Local Patches
+
+This is a patched fork of [elsbrock/plundrio](https://github.com/elsbrock/plundrio).
+
+## Patches Applied
+
+1. **Proper torrent-add response** (`internal/server/torrent.go`)
+   - Returns `{id, name, hashString}` instead of empty object
+   - Enables Sonarr/Radarr to track downloads
+
+2. **Case-insensitive hash matching** (`internal/server/torrent.go`)
+   - Uses `strings.EqualFold()` for hash comparison
+   - Fixes mismatch between uppercase hashes from *arr and lowercase from Put.io
+
+3. **AddTransfer returns transfer info** (`internal/api/client.go`)
+   - Returns `(*putio.Transfer, error)` instead of just `error`
+
+## Build & Deploy
+
+```bash
+# Build for NAS (amd64)
+docker buildx build --platform linux/amd64 -f Dockerfile.patched -t plundrio:patched --load .
+
+# Deploy to NAS
+docker save plundrio:patched -o /Volumes/docker/plundrio-patched.tar
+ssh nas "docker load -i /volume1/docker/plundrio-patched.tar && cd /volume1/docker/media-stack && docker compose up -d plundrio"
+```
+
+---
+
 <h1>🌊 plundrio</h1>
 
 <p align="center">
