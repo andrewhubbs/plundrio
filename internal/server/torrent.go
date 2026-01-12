@@ -1,9 +1,12 @@
 package server
 
 import (
+	"crypto/sha1"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +14,197 @@ import (
 	"github.com/elsbrock/go-putio"
 	"github.com/elsbrock/plundrio/internal/log"
 )
+
+// extractHashFromMagnet extracts the info hash from a magnet URI
+// Magnet format: magnet:?xt=urn:btih:HASH&dn=name&...
+func extractHashFromMagnet(magnetURI string) string {
+	// Parse the magnet URI
+	u, err := url.Parse(magnetURI)
+	if err != nil {
+		return ""
+	}
+
+	// Get the xt parameter (exact topic)
+	xt := u.Query().Get("xt")
+	if xt == "" {
+		return ""
+	}
+
+	// Extract hash from urn:btih:HASH format
+	// Handle both lowercase and uppercase prefixes
+	xt = strings.ToLower(xt)
+	if strings.HasPrefix(xt, "urn:btih:") {
+		hash := strings.TrimPrefix(xt, "urn:btih:")
+		// Hash can be hex (40 chars) or base32 (32 chars)
+		if len(hash) == 32 {
+			// Base32 encoded, decode to hex
+			hash = base32ToHex(hash)
+		}
+		return strings.ToLower(hash)
+	}
+
+	return ""
+}
+
+// base32ToHex converts a base32 encoded hash to hex
+func base32ToHex(b32 string) string {
+	// Standard base32 alphabet (RFC 4648)
+	alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+	b32 = strings.ToUpper(b32)
+
+	var bits uint64
+	var bitCount int
+	var result []byte
+
+	for _, c := range b32 {
+		idx := strings.IndexRune(alphabet, c)
+		if idx < 0 {
+			return ""
+		}
+		bits = (bits << 5) | uint64(idx)
+		bitCount += 5
+
+		for bitCount >= 8 {
+			bitCount -= 8
+			result = append(result, byte(bits>>bitCount))
+			bits &= (1 << bitCount) - 1
+		}
+	}
+
+	return hex.EncodeToString(result)
+}
+
+// extractHashFromTorrent computes the info hash from torrent file data
+// The info hash is SHA1 of the bencoded "info" dictionary
+func extractHashFromTorrent(data []byte) string {
+	// Find the info dictionary in the torrent file
+	infoStart, infoEnd := findInfoDict(data)
+	if infoStart < 0 || infoEnd < 0 {
+		return ""
+	}
+
+	// Compute SHA1 of the info dictionary
+	hash := sha1.Sum(data[infoStart:infoEnd])
+	return hex.EncodeToString(hash[:])
+}
+
+// findInfoDict finds the start and end positions of the "info" dictionary
+// in bencoded torrent data. Returns -1, -1 if not found.
+func findInfoDict(data []byte) (int, int) {
+	// Look for "4:infod" - the key "info" followed by a dictionary
+	pattern := []byte("4:infod")
+	idx := findBytes(data, pattern)
+	if idx < 0 {
+		return -1, -1
+	}
+
+	// The info dict starts at the 'd' after "4:info"
+	infoStart := idx + 6 // len("4:info") = 6
+
+	// Parse the dictionary to find its end
+	end, ok := skipBencode(data, infoStart)
+	if !ok {
+		return -1, -1
+	}
+
+	return infoStart, end
+}
+
+// findBytes finds the first occurrence of pattern in data
+func findBytes(data, pattern []byte) int {
+	for i := 0; i <= len(data)-len(pattern); i++ {
+		match := true
+		for j := 0; j < len(pattern); j++ {
+			if data[i+j] != pattern[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+// skipBencode skips a bencoded value starting at pos and returns the end position
+func skipBencode(data []byte, pos int) (int, bool) {
+	if pos >= len(data) {
+		return -1, false
+	}
+
+	switch data[pos] {
+	case 'i': // Integer: i<number>e
+		end := pos + 1
+		for end < len(data) && data[end] != 'e' {
+			end++
+		}
+		if end >= len(data) {
+			return -1, false
+		}
+		return end + 1, true
+
+	case 'l': // List: l<items>e
+		pos++
+		for pos < len(data) && data[pos] != 'e' {
+			var ok bool
+			pos, ok = skipBencode(data, pos)
+			if !ok {
+				return -1, false
+			}
+		}
+		if pos >= len(data) {
+			return -1, false
+		}
+		return pos + 1, true
+
+	case 'd': // Dictionary: d<key><value>...e
+		pos++
+		for pos < len(data) && data[pos] != 'e' {
+			// Skip key (must be a string)
+			var ok bool
+			pos, ok = skipBencode(data, pos)
+			if !ok {
+				return -1, false
+			}
+			// Skip value
+			pos, ok = skipBencode(data, pos)
+			if !ok {
+				return -1, false
+			}
+		}
+		if pos >= len(data) {
+			return -1, false
+		}
+		return pos + 1, true
+
+	case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9': // String: <len>:<data>
+		// Parse the length
+		lenEnd := pos
+		for lenEnd < len(data) && data[lenEnd] != ':' {
+			lenEnd++
+		}
+		if lenEnd >= len(data) {
+			return -1, false
+		}
+
+		// Parse length as integer
+		length := 0
+		for i := pos; i < lenEnd; i++ {
+			length = length*10 + int(data[i]-'0')
+		}
+
+		// Skip past colon and string data
+		end := lenEnd + 1 + length
+		if end > len(data) {
+			return -1, false
+		}
+		return end, true
+
+	default:
+		return -1, false
+	}
+}
 
 // findTransferByHash finds a transfer by its hash string (case-insensitive)
 // Only matches transfers in plundrio's configured folder to prevent accidental
@@ -52,6 +246,10 @@ func (s *Server) handleTorrentAdd(args json.RawMessage) (interface{}, error) {
 			return nil, fmt.Errorf("failed to decode torrent data: %w", err)
 		}
 
+		// Extract info hash from torrent data BEFORE uploading
+		// This is critical for Radarr/Sonarr tracking
+		infoHash := extractHashFromTorrent(torrentData)
+
 		// Upload torrent file to Put.io
 		name = params.Filename
 		if name == "" {
@@ -65,46 +263,65 @@ func (s *Server) handleTorrentAdd(args json.RawMessage) (interface{}, error) {
 			Str("operation", "torrent-add").
 			Str("type", "torrent").
 			Str("name", name).
+			Str("hash", infoHash).
 			Int64("folder_id", s.cfg.FolderID).
 			Msg("Torrent file uploaded")
-	} else {
-		// Handle magnet links
-		if params.MagnetLink != "" {
-			name = params.MagnetLink
-		} else if params.Filename != "" && strings.HasPrefix(params.Filename, "magnet:") {
-			name = params.Filename
-		} else {
-			return nil, fmt.Errorf("invalid torrent or magnet link provided")
-		}
 
-		// Add magnet link to Put.io
-		transfer, err := s.client.AddTransfer(name, s.cfg.FolderID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to add transfer: %w", err)
-		}
-
-		log.Info("rpc").
-			Str("operation", "torrent-add").
-			Str("type", "magnet").
-			Str("name", transfer.Name).
-			Str("hash", transfer.Hash).
-			Int64("id", transfer.ID).
-			Int64("folder_id", s.cfg.FolderID).
-			Msg("Magnet link added")
-
-		// Return success response with transfer info for *arr tracking
+		// Return success response with hash for *arr tracking
 		return map[string]interface{}{
 			"torrent-added": map[string]interface{}{
-				"id":         transfer.ID,
-				"name":       transfer.Name,
-				"hashString": transfer.Hash,
+				"name":       name,
+				"hashString": infoHash,
 			},
 		}, nil
 	}
 
-	// Return success response
+	// Handle magnet links
+	if params.MagnetLink != "" {
+		name = params.MagnetLink
+	} else if params.Filename != "" && strings.HasPrefix(params.Filename, "magnet:") {
+		name = params.Filename
+	} else {
+		return nil, fmt.Errorf("invalid torrent or magnet link provided")
+	}
+
+	// Extract hash from magnet URI - this is the reliable source
+	// Put.io may return empty hash for cached content
+	magnetHash := extractHashFromMagnet(name)
+
+	// Add magnet link to Put.io
+	transfer, err := s.client.AddTransfer(name, s.cfg.FolderID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to add transfer: %w", err)
+	}
+
+	// Use hash from magnet URI if put.io returned empty hash
+	// This happens when content is already cached on put.io
+	responseHash := transfer.Hash
+	if responseHash == "" && magnetHash != "" {
+		responseHash = magnetHash
+		log.Debug("rpc").
+			Str("operation", "torrent-add").
+			Str("magnet_hash", magnetHash).
+			Msg("Using hash extracted from magnet URI (put.io returned empty)")
+	}
+
+	log.Info("rpc").
+		Str("operation", "torrent-add").
+		Str("type", "magnet").
+		Str("name", transfer.Name).
+		Str("hash", responseHash).
+		Int64("id", transfer.ID).
+		Int64("folder_id", s.cfg.FolderID).
+		Msg("Magnet link added")
+
+	// Return success response with transfer info for *arr tracking
 	return map[string]interface{}{
-		"torrent-added": map[string]interface{}{},
+		"torrent-added": map[string]interface{}{
+			"id":         transfer.ID,
+			"name":       transfer.Name,
+			"hashString": responseHash,
+		},
 	}, nil
 }
 

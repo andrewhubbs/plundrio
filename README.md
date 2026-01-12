@@ -25,6 +25,12 @@ This is a patched fork of [elsbrock/plundrio](https://github.com/elsbrock/plundr
    - Prevents accidental deletion of content in other put.io folders (e.g., chill.institute)
    - Previously, if a transfer in another folder had the same hash, it could be deleted
 
+6. **Hash extraction for reliable tracking** (`internal/server/torrent.go`)
+   - Extracts info hash from magnet URIs when put.io returns empty hash (cached content)
+   - Extracts info hash from torrent files via bencode parsing
+   - Fixes *arr tracking failures when downloading already-cached content
+   - Root cause: put.io returns empty hash for instantly-cached transfers
+
 ## Build & Deploy
 
 ```bash
