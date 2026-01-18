@@ -31,6 +31,13 @@ This is a patched fork of [elsbrock/plundrio](https://github.com/elsbrock/plundr
    - Fixes *arr tracking failures when downloading already-cached content
    - Root cause: put.io returns empty hash for instantly-cached transfers
 
+7. **Expanded transient error handling** (`internal/download/download.go`)
+   - Added more network errors to `isTransientError()` for proper retry behavior
+   - Now retries on: `unexpected EOF`, `EOF`, `broken pipe`, `connection timed out`,
+     `connection reset by peer`, `TLS handshake timeout`, `server closed idle connection`, HTTP 500
+   - Previously, errors like "unexpected EOF" were treated as permanent failures
+   - Root cause: 112GB download failed at 74% with "unexpected EOF" and never retried
+
 ## Build & Deploy
 
 ```bash

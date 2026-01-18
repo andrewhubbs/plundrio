@@ -103,19 +103,37 @@ func isTransientError(err error) bool {
 		return false
 	}
 
-	// Check for grab errors
-	if err.Error() == "connection reset" ||
-		err.Error() == "connection refused" ||
-		err.Error() == "i/o timeout" {
+	errStr := err.Error()
+
+	// Check for grab errors (exact matches)
+	if errStr == "connection reset" ||
+		errStr == "connection refused" ||
+		errStr == "i/o timeout" {
 		return true
 	}
 
-	// Check for specific grab HTTP errors
-	if strings.Contains(err.Error(), "429") || // Too Many Requests
-		strings.Contains(err.Error(), "503") || // Service Unavailable
-		strings.Contains(err.Error(), "504") || // Gateway Timeout
-		strings.Contains(err.Error(), "502") { // Bad Gateway
-		return true
+	// Check for common transient network errors (substring matches)
+	transientPatterns := []string{
+		"unexpected EOF",
+		"EOF",
+		"broken pipe",
+		"connection timed out",
+		"connection reset by peer",
+		"no such host",
+		"network is unreachable",
+		"TLS handshake timeout",
+		"server closed idle connection",
+		"429", // Too Many Requests
+		"503", // Service Unavailable
+		"504", // Gateway Timeout
+		"502", // Bad Gateway
+		"500", // Internal Server Error (sometimes transient)
+	}
+
+	for _, pattern := range transientPatterns {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
 	}
 
 	return false
