@@ -14,22 +14,45 @@ import (
 type TransferProcessor struct {
 	manager            *Manager
 	transfers          map[string][]*putio.Transfer // Status -> Transfers
-	processedTransfers sync.Map                     // map[int64]bool - Tracks transfers that have been processed locally
+	activeTransfers    sync.Map                     // map[int64]*putio.Transfer - Transfers currently being processed
+	processedTransfers sync.Map                     // map[int64]*putio.Transfer - Transfers that have been processed locally (for Radarr)
 	retryAttempts      sync.Map                     // map[int64]int - Tracks retry attempts for errored transfers
 	folderID           int64
 	targetDir          string
 }
 
-// GetTransfers returns a copy of all transfers for a given folder ID
+// GetTransfers returns a copy of all transfers for a given folder ID,
+// including processed transfers that may no longer be in the put.io API.
+// This ensures Radarr/Sonarr can see completed downloads even after cleanup.
 func (p *TransferProcessor) GetTransfers() []*putio.Transfer {
 	var allTransfers []*putio.Transfer
+	seenIDs := make(map[int64]bool)
+
+	// First, add transfers from the put.io API (live data)
 	for _, transfers := range p.transfers {
 		for _, t := range transfers {
 			if t.SaveParentID == p.folderID {
 				allTransfers = append(allTransfers, t)
+				seenIDs[t.ID] = true
 			}
 		}
 	}
+
+	// Then, add processed transfers that are no longer in the put.io API
+	// This is critical for Radarr to see completed downloads
+	p.processedTransfers.Range(func(key, value interface{}) bool {
+		transferID := key.(int64)
+		if !seenIDs[transferID] {
+			transfer := value.(*putio.Transfer)
+			allTransfers = append(allTransfers, transfer)
+			log.Debug("transfers").
+				Int64("transfer_id", transferID).
+				Str("name", transfer.Name).
+				Msg("Including processed transfer not in put.io API")
+		}
+		return true
+	})
+
 	return allTransfers
 }
 
@@ -246,7 +269,8 @@ func (p *TransferProcessor) logAllTransfersDetails() {
 
 		// Check if this transfer is being processed locally
 		_, processed := p.processedTransfers.Load(t.ID)
-		transferLogger = transferLogger.Bool("processed_locally", processed)
+		_, active := p.activeTransfers.Load(t.ID)
+		transferLogger = transferLogger.Bool("processed_locally", processed).Bool("active_locally", active)
 
 		// Log the transfer details with a message that includes the status
 		transferLogger.Msgf("Transfer details (%s)", t.Status)
@@ -290,8 +314,11 @@ func (p *TransferProcessor) startTransferProcessing(transfer *putio.Transfer) {
 		Int64("id", transfer.ID).
 		Msg("Found ready transfer")
 
-	p.manager.workerWg.Add(1)
+	// Store the full transfer data so we can report it to Radarr even after put.io cleanup
 	transferCopy := *transfer
+	p.activeTransfers.Store(transfer.ID, &transferCopy)
+
+	p.manager.workerWg.Add(1)
 	go func() {
 		p.processTransfer(&transferCopy)
 	}()
@@ -546,12 +573,55 @@ func (p *TransferProcessor) processErroredTransfers() {
 	}
 }
 
-// MarkTransferProcessed marks a transfer as processed locally
+// MarkTransferProcessed marks a transfer as processed locally and retains
+// the transfer data for Radarr/Sonarr to query even after put.io cleanup.
 func (p *TransferProcessor) MarkTransferProcessed(transferID int64) {
-	p.processedTransfers.Store(transferID, true)
-	log.Debug("transfers").
-		Int64("transfer_id", transferID).
-		Msg("Marked transfer as processed locally")
+	// Move from activeTransfers to processedTransfers
+	if transferData, ok := p.activeTransfers.LoadAndDelete(transferID); ok {
+		transfer := transferData.(*putio.Transfer)
+		// Update the transfer status to reflect completion
+		transfer.Status = "COMPLETED"
+		transfer.PercentDone = 100
+		p.processedTransfers.Store(transferID, transfer)
+		log.Info("transfers").
+			Int64("transfer_id", transferID).
+			Str("name", transfer.Name).
+			Str("hash", transfer.Hash).
+			Msg("Transfer processed and retained for Radarr polling")
+	} else {
+		// Fallback: if not in activeTransfers, try to find in current transfers
+		for _, transfers := range p.transfers {
+			for _, t := range transfers {
+				if t.ID == transferID {
+					transferCopy := *t
+					transferCopy.Status = "COMPLETED"
+					transferCopy.PercentDone = 100
+					p.processedTransfers.Store(transferID, &transferCopy)
+					log.Info("transfers").
+						Int64("transfer_id", transferID).
+						Str("name", t.Name).
+						Str("hash", t.Hash).
+						Msg("Transfer processed (from current transfers) and retained for Radarr polling")
+					return
+				}
+			}
+		}
+		log.Warn("transfers").
+			Int64("transfer_id", transferID).
+			Msg("Could not find transfer data when marking as processed")
+	}
+}
+
+// RemoveProcessedTransfer removes a transfer from the processed list.
+// Called when Radarr/Sonarr sends torrent-remove.
+func (p *TransferProcessor) RemoveProcessedTransfer(transferID int64) {
+	if _, existed := p.processedTransfers.LoadAndDelete(transferID); existed {
+		log.Debug("transfers").
+			Int64("transfer_id", transferID).
+			Msg("Removed transfer from processed list")
+	}
+	// Also remove from activeTransfers in case it's still there
+	p.activeTransfers.Delete(transferID)
 }
 
 // finalizeCompletedTransfers checks for transfers that are marked as completed in the

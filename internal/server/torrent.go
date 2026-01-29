@@ -224,6 +224,24 @@ func (s *Server) findTransferByHash(hash string) (*putio.Transfer, error) {
 	return nil, fmt.Errorf("transfer not found with hash: %s (in folder %d)", hash, s.cfg.FolderID)
 }
 
+// findProcessedTransferByHash finds a transfer in the processed transfers list by hash.
+// This is used when a transfer has been completed and cleaned up from put.io but
+// Radarr/Sonarr still needs to send torrent-remove.
+func (s *Server) findProcessedTransferByHash(hash string) *putio.Transfer {
+	processor := s.dlManager.GetTransferProcessor()
+	if processor == nil {
+		return nil
+	}
+
+	transfers := processor.GetTransfers()
+	for _, t := range transfers {
+		if strings.EqualFold(t.Hash, hash) && t.SaveParentID == s.cfg.FolderID {
+			return t
+		}
+	}
+	return nil
+}
+
 // handleTorrentAdd processes torrent-add requests
 func (s *Server) handleTorrentAdd(args json.RawMessage) (interface{}, error) {
 	var params struct {
@@ -562,17 +580,30 @@ func (s *Server) handleTorrentRemove(args json.RawMessage) (interface{}, error) 
 
 	var lastErr error
 	successCount := 0
+	processor := s.dlManager.GetTransferProcessor()
 
 	for _, hash := range params.IDs {
+		// First try to find in put.io API
 		transfer, err := s.findTransferByHash(hash)
+		fromProcessed := false
+
 		if err != nil {
-			log.Warn("rpc").
-				Str("operation", "torrent-remove").
-				Str("hash", hash).
-				Err(err).
-				Msg("Transfer not found in Put.io - may already be removed")
-			// Don't treat "not found" as an error - the transfer might already be gone
-			// Continue to try deleting local data if requested
+			// Not found in put.io - try to find in processed transfers
+			transfer = s.findProcessedTransferByHash(hash)
+			if transfer != nil {
+				fromProcessed = true
+				log.Info("rpc").
+					Str("operation", "torrent-remove").
+					Str("hash", hash).
+					Str("name", transfer.Name).
+					Msg("Found transfer in processed list (already removed from put.io)")
+			} else {
+				log.Warn("rpc").
+					Str("operation", "torrent-remove").
+					Str("hash", hash).
+					Err(err).
+					Msg("Transfer not found in Put.io or processed list")
+			}
 		}
 
 		// Delete local data if requested and transfer name is known
@@ -597,8 +628,17 @@ func (s *Server) handleTorrentRemove(args json.RawMessage) (interface{}, error) 
 			}
 		}
 
-		// Skip Put.io deletion if transfer wasn't found
-		if transfer == nil {
+		// Clean up from processed transfers list
+		if transfer != nil && processor != nil {
+			processor.RemoveProcessedTransfer(transfer.ID)
+		}
+
+		// Skip Put.io deletion if transfer wasn't found or was only in processed list
+		if transfer == nil || fromProcessed {
+			if transfer != nil {
+				// Transfer was in processed list, count as success
+				successCount++
+			}
 			continue
 		}
 
